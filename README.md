@@ -36,7 +36,10 @@ firmware over USB, no tools inside the case).
 - **Ready-made:** download `GrooveBox.bin` from the [releases](https://github.com/fedepaj/groovebox/releases)
   and send it to the pad: `dfu-util -d 1209:0002 -a 0 -D GrooveBox.bin` (hold **SHIFT + PLAY**
   while switching the pad on to get the bootloader, or upload from a running firmware).
-- **From the Arduino IDE / arduino-cli:** install the [SMC-PAD core](https://github.com/fedepaj/open-smc-pad/tree/main/arduino#install) (Boards Manager),
+- **From the Arduino IDE / arduino-cli:** add
+  `https://github.com/fedepaj/open-smc-pad/releases/latest/download/package_smcpad_index.json`
+  to *Settings → Additional boards manager URLs*, install **SMC-PAD (open firmware)** from the
+  Boards Manager ([details](https://github.com/fedepaj/open-smc-pad/tree/main/arduino#install)),
   open `GrooveBox/GrooveBox.ino`, board **M-Vave SMC-PAD (open firmware)**, Upload.
 
 The pad shows up as a class-compliant USB-MIDI device ("SMC-PAD open fw") and, once Bluetooth
