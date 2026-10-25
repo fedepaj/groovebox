@@ -34,6 +34,7 @@ static int stepPage;
 static bool knobPageB;
 static bool recording;
 static bool nrPage;                                  // note repeat settings on the pads
+static bool fxPage;                                  // the FX page on the pads (SHIFT + PLAY)
 static bool held[16];
 static int8_t sentNote[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 static uint8_t sentChannel[16];
@@ -261,6 +262,100 @@ static void aftertouch() {
   }
 }
 
+// ---------------------------------------------------------------- FX page (the engine has the FX)
+// Macros: the last three pads send a CC while held, on the selected track's channel. Held: the
+// CC goes to its "held" value (or, with pressure depth on, follows the pad's pressure from the
+// rest value towards it); let go: back to the rest value.
+
+static int8_t fxLast = -1;                          // the FX pad pressed last: its parameters are on the knobs
+static uint8_t macroCC[3], macroChannel[3], macroLast[3];
+static uint32_t macroAtMs[3];
+
+static void macroPress(int pad) {
+  int m = pad - FX_MACRO_A;
+  const uint8_t *p = fxParam[pad];
+  macroCC[m] = p[0];
+  macroChannel[m] = pattern.track[selectedTrack].channel;
+  macroLast[m] = p[3] ? p[2] : p[1];                // pressure depth starts at rest
+  cc(macroChannel[m], macroCC[m], macroLast[m]);
+  macroAtMs[m] = millis();
+}
+
+static void macroRelease(int pad) {
+  int m = pad - FX_MACRO_A;
+  macroLast[m] = fxParam[pad][2];
+  cc(macroChannel[m], macroCC[m], macroLast[m]);
+}
+
+static void macroRefresh(int pad) {                 // a parameter changed while held: hear it now
+  int m = pad - FX_MACRO_A;
+  if (fxParam[pad][3] || fxParam[pad][1] == macroLast[m]) return;   // pressure depth follows the pad itself
+  macroLast[m] = fxParam[pad][1];
+  cc(macroChannel[m], macroCC[m], macroLast[m]);
+}
+
+static void macroRun() {                            // pressure depth: follow the pad, not faster than 30 ms
+  uint32_t now = millis();
+  for (int m = 0; m < 3; m++) {
+    int pad = FX_MACRO_A + m;
+    if (!fxOn(pad) || !fxParam[pad][3] || now - macroAtMs[m] < 30) continue;
+    const uint8_t *p = fxParam[pad];
+    int v = p[2] + ((int)p[1] - (int)p[2]) * pressureLevel(pad) / 127;
+    if (v == macroLast[m]) continue;
+    macroLast[m] = v;
+    macroAtMs[m] = now;
+    cc(macroChannel[m], macroCC[m], v);
+  }
+}
+
+static void fxPress(int pad) {
+  fxSolo = selectedTrack;
+  fxLast = pad;
+  fxSet(pad, true);
+  if (pad >= FX_MACRO_A) macroPress(pad);
+}
+
+static void fxRelease(int pad) {
+  if (pad >= FX_MACRO_A && fxOn(pad)) macroRelease(pad);
+  fxSet(pad, false);
+}
+
+static void fxReleaseEverything() { for (int i = 0; i < FX_COUNT; i++) if (fxOn(i)) fxRelease(i); }
+
+// the FX whose parameters the knobs edit: the last pressed, else any other held
+static int fxEditPad() {
+  if (fxLast >= 0 && fxOn(fxLast)) return fxLast;
+  for (int i = FX_COUNT - 1; i >= 0; i--) if (fxOn(i)) return i;
+  return -1;
+}
+
+// the parameters survive a power cycle: EEPROM at 64 (the settings are at 0)
+static const int FX_EEPROM = 64;
+static const uint32_t FX_MAGIC = 0x47460001;        // "GF" v1
+struct FxSave { uint32_t magic; uint8_t p[FX_COUNT][4]; };
+static uint32_t fxChangedAt;
+
+static void fxParamsChanged() { fxChangedAt = millis() | 1; }
+
+static void fxLoad() {
+  FxSave f;
+  EEPROM.get(FX_EEPROM, f);
+  fxParamDefaults();
+  if (f.magic != FX_MAGIC) return;
+  for (int i = 0; i < FX_COUNT; i++)
+    for (int j = 0; j < fxDef[i].n; j++) fxParam[i][j] = min(f.p[i][j], fxDef[i].max[j]);
+}
+
+static void fxSaveWhenIdle() {                      // not while playing: a flash write stalls the clock
+  if (!fxChangedAt || playing || millis() - fxChangedAt < 2000) return;
+  FxSave f;
+  f.magic = FX_MAGIC;
+  memcpy(f.p, fxParam, sizeof(f.p));
+  EEPROM.put(FX_EEPROM, f);
+  EEPROM.commit();
+  fxChangedAt = 0;
+}
+
 // ---------------------------------------------------------------- euclid
 
 static void euclid(int t, int hits, int rotate) {
@@ -303,6 +398,15 @@ static uint32_t nrPageLed(int pad) {
   return millis() % beatMs < beatMs / 4 ? 0x808080 : 0x080808;
 }
 
+// FX page: pad n is FX n, counting from the bottom-left. A held FX lights fully, the rest sit
+// dim in their own colour; a macro follows the pressure.
+static uint32_t fxPageLed(int pad) {
+  uint32_t c = fxDef[pad].color;
+  if (!fxOn(pad)) return scale(c, 1, 8);
+  if (pad >= FX_MACRO_A && fxParam[pad][3]) return scale(c, 40 + pressureLevel(pad), 167);   // brighter as you press
+  return c;
+}
+
 static uint32_t shiftPlayLed(int pad) {
   if (pad < 8) return pad == selectedTrack ? scale(trackColor[pad], 1, 3) : 0;
   if (pad < 12) return pad - 8 == settings.curve ? 0x603000 : 0x0C0600;
@@ -314,6 +418,7 @@ static uint32_t padLed(int pad) {
   uint32_t now = millis();
   if (now < overlayUntil) return overlayLed(pad);
   if (nrPage) return nrPageLed(pad);
+  if (fxPage) return fxPageLed(pad);
   bool shift = SMCPad.button(B_SHIFT);
   switch (mode) {
     case MODE_PLAY: {
@@ -383,6 +488,7 @@ static void showButtonLeds() {
   SMCPad.buttonLed(B_LEFT, low || SMCPad.button(B_LEFT) || (mode == MODE_STEP && stepPage > 0));
   SMCPad.buttonLed(B_RIGHT, low || SMCPad.button(B_RIGHT) || (mode == MODE_STEP && stepPage < pages - 1));
   uint32_t beat = (tick - patternStartTick) % PPQN;
+  if (fxPage) SMCPad.buttonLed(B_PLAY, now % 200 < 100); else
   SMCPad.buttonLed(B_PLAY, playing && beat < PPQN / 4 ? true : playing && beat >= PPQN / 4 ? (beat / 12) % 8 != 0 : false);
   SMCPad.buttonLed(B_STOP, SMCPad.button(B_STOP));
   SMCPad.buttonLed(B_REC, recording && (playing || blink));
@@ -416,6 +522,10 @@ static void onPadPress(int pad, int velocity) {
     else if (pad == 14) syncExternal = settings.sync = !settings.sync;
     else tapTempo();
     settingsChanged();
+    return;
+  }
+  if (fxPage) {
+    fxPress(pad);
     return;
   }
   bool shift = SMCPad.button(B_SHIFT);
@@ -481,6 +591,7 @@ static void onPadPress(int pad, int velocity) {
 static void onPadRelease(int pad) {
   held[pad] = false;
   needShow = true;
+  if (fxOn(pad)) { fxRelease(pad); return; }       // an FX let go
   switch (mode) {
     case MODE_PLAY:
       if (latched[pad] && nrActive()) return;
@@ -520,6 +631,8 @@ static void setMode(Mode m) {
   if (m != MODE_PLAY) allPadNotesOff();
   mode = m;
   nrPage = false;
+  fxPage = false;
+  fxReleaseEverything();
   for (int i = 0; i < 16; i++) stepHeld[i] = false;
   if (stepPage * 16 >= pattern.track[selectedTrack].length) stepPage = 0;
   needShow = true;
@@ -552,6 +665,12 @@ static void onButtonPress(int b) {
       break;
     }
     case B_PLAY:
+      if (shift) {                                     // SHIFT + PLAY: the FX page
+        fxPage = !fxPage;
+        nrPage = false;
+        if (!fxPage) fxReleaseEverything();
+        break;
+      }
       if (syncExternal && abletonActive) { abletonTransport(!playing); break; }   // Live leads
       if (extAlive()) break;                           // the external clock is in charge
       if (playing) transportStop(); else transportStart();
@@ -567,7 +686,7 @@ static void onButtonPress(int b) {
       recording = !recording;
       break;
     case B_REPEAT:
-      if (shift) { nrPage = !nrPage; break; }
+      if (shift) { nrPage = !nrPage; if (nrPage) { fxPage = false; fxReleaseEverything(); } break; }
       if (nrPage) { nrPage = false; break; }
       if (mode != MODE_PLAY) { fillHeld = true; break; }
       if (settings.latch) {
@@ -684,8 +803,24 @@ static void knobPageBTurn(int knob, int delta) {
   }
 }
 
+// FX page, an FX pad held: knobs 1-4 are its parameters
+static void fxKnob(int knob, int delta) {
+  int pad = fxEditPad();
+  if (pad < 0 || knob >= fxDef[pad].n) return;
+  uint8_t max = fxDef[pad].max[knob];
+  int steps = knobSteps(knob, delta, max < 16 ? 2 : 1);
+  if (!steps) return;
+  int inc = max >= 32 && !(pad >= FX_MACRO_A && knob == 0) ? 2 : 1;   // a macro's CC number goes one by one
+  int v = constrain((int)fxParam[pad][knob] + steps * inc, 0, (int)max);
+  fxParam[pad][knob] = v;
+  if (pad >= FX_MACRO_A) macroRefresh(pad);
+  showValue(v, max, fxDef[pad].color);
+  fxParamsChanged();
+}
+
 static void onKnob(int knob, int delta) {
   needShow = true;
+  if (fxPage && fxMask) { fxKnob(knob, delta); return; }
   if (SMCPad.button(B_SHIFT) && knob < 5) {           // setup: global, and the track's voice
     int steps = knobSteps(knob, delta, knob == 0 || knob == 3 ? 1 : 2);
     if (!steps) return;
@@ -740,6 +875,7 @@ static void midiIn() {
 
 void setup() {
   settingsLoad();
+  fxLoad();
   bpm = settings.bpm;
   syncExternal = settings.sync;
   storeBegin();
@@ -765,6 +901,7 @@ void loop() {
   engineRun();
   noteRepeatRun();
   aftertouch();
+  macroRun();
   uint32_t now = millis();
   if (btDownAt && now - btDownAt > 800) {
     btDownAt = 0;
@@ -797,4 +934,5 @@ void loop() {
   showPads();
   showButtonLeds();
   settingsSaveWhenIdle();
+  fxSaveWhenIdle();
 }
