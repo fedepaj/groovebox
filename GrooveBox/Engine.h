@@ -24,6 +24,7 @@ static bool fillHeld;
 
 // external clock
 static bool syncExternal;                           // follow 0xF8 instead of the own tempo
+static bool clockOut = true;                        // send clock, start, stop (master)
 static uint32_t extClocks, extLastUs, extIntervalUs = 20833;
 static bool extAlive() { return syncExternal && micros() - extLastUs < 500000; }
 
@@ -190,7 +191,7 @@ static void onTick() {
   uint32_t rel = tick - patternStartTick;
   if (rel && rel % (TICKS_PER_STEP * pattern.length) == 0 && patternBoundary()) rel = 0;
   if (tick % 4 == 0) {
-    if (!extAlive()) midiSend(0xF8);                // clock out, 24 PPQN
+    if (clockOut) midiSend(0xF8);                   // clock out, 24 PPQN
     noteRepeatClock();
   }
   for (int t = 0; t < TRACKS; t++) {
@@ -211,14 +212,14 @@ static void transportStart() {
   playing = true;
   tick = patternStartTick = 0;
   nextTickUs = micros();
-  if (!extAlive()) midiSend(0xFA);
+  if (clockOut) midiSend(0xFA);
 }
 
 static void transportStop() {
   if (!playing) return;
   playing = false;
   flushEvents();
-  if (!extAlive()) midiSend(0xFC);
+  if (clockOut) midiSend(0xFC);
   for (int t = 0; t < TRACKS; t++) skipStep[t] = -1;
   patternSave();
 }
@@ -232,9 +233,12 @@ static void engineRun() {
   if (!playing) {
     // master clock keeps running while stopped, so a synced DAW knows the tempo
     static uint32_t nextClockUs;
-    if (!extAlive() && (int32_t)(now - nextClockUs) >= 0) {
+    if (clockOut && (int32_t)(now - nextClockUs) >= 0) {
+      uint32_t period = 4 * (625000UL / bpm);
       midiSend(0xF8);
-      nextClockUs = now + 4 * (625000UL / bpm);
+      // from when it was due, not from now: the loop's delay must not slow the tempo down
+      nextClockUs += period;
+      if ((int32_t)(now - nextClockUs) >= 0) nextClockUs = now + period;   // after a stall
     }
     return;
   }

@@ -14,7 +14,7 @@
 // SHIFT + STOP (1 s) the kit back to notes 36-51 on channel 10,
 // KNOB BANK knob page (A: velocity, gate, length, speed, -, -, euclid hits, euclid rotation;
 // B: CCs 70-77), SHIFT + knobs 1-5: tempo, swing, pattern length, track note, track channel,
-// SHIFT + NOTE REPEAT: note repeat settings (as stock: rate, swing, latch, sync, tap tempo),
+// SHIFT + NOTE REPEAT: note repeat settings (as stock: rate, swing, latch, tap tempo) and the MIDI clock (out / in / off),
 // NOTE REPEAT outside PLAY = fill, BT long press = Bluetooth.
 // With Live's SMC_PAD control surface (ableton/SMC_PAD) the pads take the Drum Rack's colours
 // and empty drum pads stay dark.
@@ -298,7 +298,11 @@ static uint32_t nrPageLed(int pad) {
   if (pad < 8) return pad == settings.rate ? 0x00A0A0 : 0x001010;
   if (pad < 13) return pad - 8 == settings.swing ? 0xA000A0 : 0x100010;
   if (pad == 13) return settings.latch ? 0xA0A000 : 0x101000;
-  if (pad == 14) return settings.sync ? (extAlive() ? 0x00C000 : 0xC03000) : 0x001000;
+  if (pad == 14) {                                   // clock: OUT blue, IN green (orange: none
+    if (settings.clock == CLOCK_OUT) return 0x0040C0;   // coming in yet), OFF dim
+    if (settings.clock == CLOCK_IN) return extAlive() ? 0x00C000 : 0xC03000;
+    return 0x101010;
+  }
   uint32_t beatMs = 60000UL / bpm;
   return millis() % beatMs < beatMs / 4 ? 0x808080 : 0x080808;
 }
@@ -402,6 +406,15 @@ static void bluetoothApply() {
   }
 }
 
+// ---------------------------------------------------------------- MIDI clock mode
+
+static void clockSet(uint8_t m) {
+  if (clockOut && m != CLOCK_OUT && playing) midiSend(0xFC);   // followers: stop, no more clock
+  settings.clock = m;
+  syncExternal = m == CLOCK_IN;
+  clockOut = m == CLOCK_OUT;
+}
+
 // ---------------------------------------------------------------- pads
 
 static void onPadPress(int pad, int velocity) {
@@ -413,7 +426,7 @@ static void onPadPress(int pad, int velocity) {
     if (pad < 8) settings.rate = pad;
     else if (pad < 13) settings.swing = pad - 8;
     else if (pad == 13) { settings.latch = !settings.latch; nrToggled = false; }
-    else if (pad == 14) syncExternal = settings.sync = !settings.sync;
+    else if (pad == 14) clockSet((settings.clock + 1) % CLOCK_MODES);
     else tapTempo();
     settingsChanged();
     return;
@@ -741,7 +754,7 @@ static void midiIn() {
 void setup() {
   settingsLoad();
   bpm = settings.bpm;
-  syncExternal = settings.sync;
+  clockSet(settings.clock);
   storeBegin();
   currentSlot = settings.slot % PATTERNS;
   storeLoad(currentSlot, pattern);
